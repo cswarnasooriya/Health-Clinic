@@ -3,11 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -26,9 +24,10 @@ import (
 // ==========================================
 
 type Patient struct {
-	ID   uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
-	Name string    `gorm:"not null" json:"name"`
-	Age  int       `json:"age"`
+	ID     uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
+	Name   string    `gorm:"not null" json:"name"`
+	Age    int       `json:"age"`
+	Gender string    `json:"gender"` // අලුතින් එක් කළා
 }
 
 type Consultation struct {
@@ -73,8 +72,10 @@ type Bill struct {
 // ==========================================
 
 type ProcessNoteRequest struct {
-	PatientID uuid.UUID `json:"patient_id" binding:"required"`
-	RawInput  string    `json:"raw_input" binding:"required"`
+	PatientName   string `json:"patient_name" binding:"required"`
+	PatientAge    int    `json:"patient_age" binding:"required"`
+	PatientGender string `json:"patient_gender" binding:"required"`
+	RawInput      string `json:"raw_input" binding:"required"`
 }
 
 type AIParsedDrug struct {
@@ -101,7 +102,6 @@ type AIParsedResult struct {
 var db *gorm.DB
 
 func main() {
-	// අලුතින් එකතු කරපු කෑල්ල: .env file එක load කරනවා
 	err := godotenv.Load()
 	if err != nil {
 		log.Println("No .env file found or error loading it")
@@ -114,16 +114,17 @@ func main() {
 
 	db, err = gorm.Open(postgres.New(postgres.Config{
 		DSN:                  dsn,
-		PreferSimpleProtocol: true, // Supabase Pooler එකත් එක්ක වැඩ කරන්න මේක අනිවාර්යයි
+		PreferSimpleProtocol: true,
 	}), &gorm.Config{})
 
 	if err != nil {
 		log.Fatal("Failed to connect to database:", err)
 	}
 
-	r := gin.Default()
+	// Database Schema එක auto update කිරීමට මෙය එක් කරන්න
+	db.AutoMigrate(&Patient{}, &Consultation{}, &Prescription{}, &LabTest{}, &Bill{})
 
-	// Enable CORS for React Frontend
+	r := gin.Default()
 	r.Use(cors.Default())
 
 	api := r.Group("/api")
@@ -134,7 +135,7 @@ func main() {
 
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "3000" // Set to 3000 by default
+		port = "3000"
 	}
 	r.Run(":" + port)
 }
@@ -157,84 +158,77 @@ func processNoteHandler(c *gin.Context) {
 	}
 
 	tx := db.Begin()
-	if tx.Error != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start database transaction"})
+
+	// Step 1: Create Patient
+	patient := Patient{
+		ID:     uuid.New(),
+		Name:   req.PatientName,
+		Age:    req.PatientAge,
+		Gender: req.PatientGender,
+	}
+	if err := tx.Create(&patient).Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create patient"})
 		return
 	}
 
+	// Step 2: Create Consultation
 	consultation := Consultation{
-		PatientID:           req.PatientID,
+		ID:                  uuid.New(),
+		PatientID:           patient.ID,
 		RawVoiceOrTextInput: req.RawInput,
 		ParsedObservations:  parsedData.Observations,
 	}
-
 	if err := tx.Create(&consultation).Error; err != nil {
 		tx.Rollback()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save consultation"})
 		return
 	}
 
+	// Step 3: Create Prescriptions
 	var totalDrugsCost float64 = 0
 	for _, d := range parsedData.Drugs {
-		prescription := Prescription{
+		p := Prescription{
+			ID:             uuid.New(),
 			ConsultationID: consultation.ID,
 			DrugName:       d.Name,
 			Dosage:         d.Dosage,
 			Cost:           d.Cost,
 		}
-		if err := tx.Create(&prescription).Error; err != nil {
-			tx.Rollback()
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save prescription"})
-			return
-		}
+		tx.Create(&p)
 		totalDrugsCost += d.Cost
 	}
 
+	// Step 4: Create Lab Tests
 	var totalTestsCost float64 = 0
 	for _, t := range parsedData.LabTests {
-		labTest := LabTest{
+		lt := LabTest{
+			ID:             uuid.New(),
 			ConsultationID: consultation.ID,
 			TestName:       t.Name,
 			Cost:           t.Cost,
 		}
-		if err := tx.Create(&labTest).Error; err != nil {
-			tx.Rollback()
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save lab test"})
-			return
-		}
+		tx.Create(&lt)
 		totalTestsCost += t.Cost
 	}
 
+	// Step 5: Create Bill
 	const doctorFee = 1500.00
 	bill := Bill{
+		ID:             uuid.New(),
 		ConsultationID: consultation.ID,
 		TotalDrugsCost: totalDrugsCost,
 		TotalTestsCost: totalTestsCost,
 		OtherCharges:   doctorFee,
 	}
+	tx.Create(&bill)
 
-	if err := tx.Create(&bill).Error; err != nil {
-		tx.Rollback()
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save bill"})
-		return
-	}
+	tx.Commit()
 
-	if err := tx.Commit().Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction"})
-		return
-	}
-
+	// Return full data
 	var completeConsultation Consultation
-	err = db.Preload("Patient").
-		Preload("Prescriptions").
-		Preload("LabTests").
-		Preload("Bill").
-		First(&completeConsultation, "id = ?", consultation.ID).Error
-
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch saved record"})
-		return
-	}
+	db.Preload("Patient").Preload("Prescriptions").Preload("LabTests").Preload("Bill").
+		First(&completeConsultation, "id = ?", consultation.ID)
 
 	c.JSON(http.StatusOK, completeConsultation)
 }
@@ -248,99 +242,52 @@ func getConsultationHandler(c *gin.Context) {
 	}
 
 	var consultation Consultation
-	result := db.Preload("Patient").
-		Preload("Prescriptions").
-		Preload("LabTests").
-		Preload("Bill").
-		First(&consultation, "id = ?", id)
+	result := db.Preload("Patient").Preload("Prescriptions").Preload("LabTests").Preload("Bill").First(&consultation, "id = ?", id)
 
 	if result.Error != nil {
-		if result.Error == gorm.ErrRecordNotFound {
-			c.JSON(http.StatusNotFound, gin.H{"error": "Consultation not found"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": result.Error.Error()})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Consultation not found"})
 		return
 	}
 
 	c.JSON(http.StatusOK, consultation)
 }
 
-// ==========================================
-// 5. AI Integration (Google Gemini)
-// ==========================================
-
+// AI Integration සහ MockParsing ශ්‍රිත එලෙසම පවතී...
 func parseNoteWithAI(ctx context.Context, rawInput string) (*AIParsedResult, error) {
 	apiKey := os.Getenv("GEMINI_API_KEY")
 	if apiKey == "" {
-		log.Println("WARNING: GEMINI_API_KEY not set. Using mock AI response.")
 		return mockAIParsing(rawInput), nil
 	}
 
 	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create AI client: %w", err)
+		return nil, err
 	}
 	defer client.Close()
 
-	// model := client.GenerativeModel("gemini-1.5-flash")
-	model := client.GenerativeModel("gemini-2.5-flash")
+	model := client.GenerativeModel("gemini-2.5-flash") // Version එක fixed කළා
 	model.ResponseMIMEType = "application/json"
-
 	model.SystemInstruction = &genai.Content{
 		Parts: []genai.Part{
-			genai.Text(`You are a strict medical data extractor. Parse the raw input and return ONLY a valid JSON object. 
-DO NOT use markdown formatting, backticks, or bullet points (like '-'). 
-Use exactly this JSON schema:
-{
-  "observations": "string (summary of notes)",
-  "drugs": [{"name": "string", "dosage": "string", "cost": number}],
-  "lab_tests": [{"name": "string", "cost": number}]
-}
-If a cost is not mentioned, use 0. Return NOTHING ELSE except the JSON object.`),
+			genai.Text(`Parse raw medical notes into JSON with 'observations', 'drugs' (name, dosage, cost), and 'lab_tests' (name, cost). No markdown.`),
 		},
 	}
 
 	resp, err := model.GenerateContent(ctx, genai.Text(rawInput))
 	if err != nil {
-		return nil, fmt.Errorf("AI generation error: %w", err)
+		return nil, err
 	}
 
-	if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
-		return nil, fmt.Errorf("empty response from AI")
-	}
-
-	part := resp.Candidates[0].Content.Parts[0]
-	text, ok := part.(genai.Text)
-	if !ok {
-		return nil, fmt.Errorf("unexpected response type from AI")
-	}
-
-	jsonText := string(text)
-
-	jsonText = strings.TrimPrefix(jsonText, "```json")
-	jsonText = strings.TrimPrefix(jsonText, "```")
-	jsonText = strings.TrimSuffix(jsonText, "```")
-	jsonText = strings.TrimSpace(jsonText)
-
+	text := string(resp.Candidates[0].Content.Parts[0].(genai.Text))
 	var result AIParsedResult
-	if err := json.Unmarshal([]byte(jsonText), &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal AI JSON: %w", err)
-	}
-
+	json.Unmarshal([]byte(text), &result)
 	return &result, nil
 }
 
 func mockAIParsing(rawInput string) *AIParsedResult {
 	return &AIParsedResult{
-		Observations: "Patient presents with mild fever and sore throat. Suspected viral pharyngitis.",
-		Drugs: []AIParsedDrug{
-			{Name: "Paracetamol", Dosage: "500mg BID", Cost: 150.00},
-			{Name: "Amoxicillin", Dosage: "250mg TID", Cost: 450.00},
-		},
-		LabTests: []AIParsedTest{
-			{Name: "Complete Blood Count (CBC)", Cost: 800.00},
-			{Name: "Throat Swab Culture", Cost: 1200.00},
-		},
+		Observations: "Mock observation",
+		Drugs:        []AIParsedDrug{{Name: "Mock Drug", Dosage: "1 daily", Cost: 100}},
+		LabTests:     []AIParsedTest{{Name: "Mock Test", Cost: 500}},
 	}
 }

@@ -1,0 +1,17 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Print කරද්දී අනවශ්‍ය දේවල් අයින් කරන්න */
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  body {
+    background-color: white !important;
+  }
+  .print-area {
+    box-shadow: none !important;
+    border: none !important;
+  }
+}
