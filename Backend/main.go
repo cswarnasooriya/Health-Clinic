@@ -27,7 +27,7 @@ type Patient struct {
 	ID     uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
 	Name   string    `gorm:"not null" json:"name"`
 	Age    int       `json:"age"`
-	Gender string    `json:"gender"` // අලුතින් එක් කළා
+	Gender string    `json:"gender"`
 }
 
 type Consultation struct {
@@ -64,7 +64,8 @@ type Bill struct {
 	TotalDrugsCost float64   `gorm:"type:decimal(10,2);default:0.00" json:"total_drugs_cost"`
 	TotalTestsCost float64   `gorm:"type:decimal(10,2);default:0.00" json:"total_tests_cost"`
 	OtherCharges   float64   `gorm:"type:decimal(10,2);default:0.00" json:"other_charges"`
-	FinalAmount    float64   `gorm:"->;type:decimal(10,2)" json:"final_amount"`
+	// Database error එක මගහරින්න column නම වෙනස් කළා, නමුත් JSON එක Frontend එකට යන්නේ පරණ විදිහටමයි
+	FinalAmount float64 `gorm:"column:final_payable_amount;type:decimal(10,2);default:0.00" json:"final_amount"`
 }
 
 // ==========================================
@@ -121,7 +122,6 @@ func main() {
 		log.Fatal("Failed to connect to database:", err)
 	}
 
-	// Database Schema එක auto update කිරීමට මෙය එක් කරන්න
 	db.AutoMigrate(&Patient{}, &Consultation{}, &Prescription{}, &LabTest{}, &Bill{})
 
 	r := gin.Default()
@@ -212,20 +212,22 @@ func processNoteHandler(c *gin.Context) {
 		totalTestsCost += t.Cost
 	}
 
-	// Step 5: Create Bill
+	// Step 5: Create Bill with calculations
 	const doctorFee = 1500.00
+	finalAmount := totalDrugsCost + totalTestsCost + doctorFee
+
 	bill := Bill{
 		ID:             uuid.New(),
 		ConsultationID: consultation.ID,
 		TotalDrugsCost: totalDrugsCost,
 		TotalTestsCost: totalTestsCost,
 		OtherCharges:   doctorFee,
+		FinalAmount:    finalAmount,
 	}
 	tx.Create(&bill)
 
 	tx.Commit()
 
-	// Return full data
 	var completeConsultation Consultation
 	db.Preload("Patient").Preload("Prescriptions").Preload("LabTests").Preload("Bill").
 		First(&completeConsultation, "id = ?", consultation.ID)
@@ -252,7 +254,10 @@ func getConsultationHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, consultation)
 }
 
-// AI Integration සහ MockParsing ශ්‍රිත එලෙසම පවතී...
+// ==========================================
+// 5. AI Integration
+// ==========================================
+
 func parseNoteWithAI(ctx context.Context, rawInput string) (*AIParsedResult, error) {
 	apiKey := os.Getenv("GEMINI_API_KEY")
 	if apiKey == "" {
@@ -265,11 +270,23 @@ func parseNoteWithAI(ctx context.Context, rawInput string) (*AIParsedResult, err
 	}
 	defer client.Close()
 
-	model := client.GenerativeModel("gemini-2.5-flash") // Version එක fixed කළා
+	model := client.GenerativeModel("gemini-2.5-flash")
 	model.ResponseMIMEType = "application/json"
+
 	model.SystemInstruction = &genai.Content{
 		Parts: []genai.Part{
-			genai.Text(`Parse raw medical notes into JSON with 'observations', 'drugs' (name, dosage, cost), and 'lab_tests' (name, cost). No markdown.`),
+			genai.Text(`You are an expert medical data extractor. Extract data from the input and return ONLY a raw JSON object. Do not include markdown.
+
+IMPORTANT RULES:
+1. For 'cost' fields, use PURE NUMBERS ONLY (e.g., 250, 850). DO NOT include currency symbols like "LKR", "Rs", or "rupees". If no cost is mentioned, strictly use 0.
+2. Ensure 'observations' contains a summary of the symptoms and diagnosis.
+
+JSON Schema:
+{
+  "observations": "string (summary of symptoms and diagnosis)",
+  "drugs": [{"name": "string", "dosage": "string", "cost": number}],
+  "lab_tests": [{"name": "string", "cost": number}]
+}`),
 		},
 	}
 
@@ -279,8 +296,16 @@ func parseNoteWithAI(ctx context.Context, rawInput string) (*AIParsedResult, err
 	}
 
 	text := string(resp.Candidates[0].Content.Parts[0].(genai.Text))
+
+	log.Println("\n--- AI EXTRACTED JSON ---")
+	log.Println(text)
+	log.Println("-------------------------\n")
+
 	var result AIParsedResult
-	json.Unmarshal([]byte(text), &result)
+	if err := json.Unmarshal([]byte(text), &result); err != nil {
+		return nil, err
+	}
+
 	return &result, nil
 }
 
