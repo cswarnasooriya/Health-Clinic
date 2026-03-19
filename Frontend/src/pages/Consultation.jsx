@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
 import { 
   Activity, 
@@ -11,94 +11,134 @@ import {
   AlertCircle,
   Download,
   Stethoscope,
-  Mic, // අලුතින් Mic icon එක ගත්තා
-  MicOff // Mic Off icon එක ගත්තා
+  Mic, 
+  MicOff,
+  Edit2,
+  Check,
+  X
 } from 'lucide-react';
 
-// Speech Recognition setup (Browser compatibility සඳහා)
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-const mic = SpeechRecognition ? new SpeechRecognition() : null;
-
-if (mic) {
-  mic.continuous = true;
-  mic.interimResults = true;
-  mic.lang = 'en-US'; // භාෂාව ඉංග්‍රීසි
-}
 
 function Consultation() {
   const [patientName, setPatientName] = useState('');
   const [patientAge, setPatientAge] = useState('');
   const [patientGender, setPatientGender] = useState('Male');
+  
+  // Voice Recording States
   const [rawInput, setRawInput] = useState('');
+  const [interimInput, setInterimInput] = useState(''); // Holds words currently being spoken
+  const [isListening, setIsListening] = useState(false);
+  const recognitionRef = useRef(null);
+
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   
-  // Voice Recording State
-  const [isListening, setIsListening] = useState(false);
+  // Edit Mode State
+  const [editingItem, setEditingItem] = useState(null);
+  const [editCost, setEditCost] = useState('');
 
-  // Speech Recognition Logic
   useEffect(() => {
-    if (!mic) return;
+    if(!SpeechRecognition) return;
+    
+    const recognition = new SpeechRecognition();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = 'en-US';
 
-    mic.onstart = () => {
-      console.log('Mic is on');
+    recognition.onresult = (event) => {
+        let finalTranscript = '';
+        let currentInterim = '';
+        
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+            if (event.results[i].isFinal) {
+                finalTranscript += event.results[i][0].transcript + ' ';
+            } else {
+                currentInterim += event.results[i][0].transcript;
+            }
+        }
+        
+        // Append ONLY finalized words to the main input
+        if (finalTranscript) {
+            setRawInput(prev => prev + finalTranscript);
+        }
+        // Update the temporary interim state (cleared when finalized)
+        setInterimInput(currentInterim);
     };
 
-    mic.onresult = (event) => {
-      const transcript = Array.from(event.results)
-        .map(result => result[0])
-        .map(result => result.transcript)
-        .join('');
-      
-      // කතා කරන දේ Text Box එකට දානවා
-      setRawInput(transcript);
+    recognition.onerror = (e) => { 
+        console.log('Error:', e.error); 
+        setIsListening(false); 
+        setInterimInput('');
+        if(e.error === 'not-allowed') {
+            alert("Microphone access denied. Please check your browser settings.");
+        }
+    };
+    
+    recognition.onend = () => { 
+        setIsListening(false); 
+        setInterimInput('');
     };
 
-    mic.onerror = (event) => {
-      console.error(event.error);
-      setIsListening(false);
-    };
+    recognitionRef.current = recognition;
 
-    mic.onend = () => {
-      setIsListening(false);
-    };
-
+    return () => {
+        if(recognitionRef.current) recognitionRef.current.stop();
+    }
   }, []);
 
-  // Button එක එබුවම Mic එක On/Off වෙන function එක
   const toggleListen = () => {
-    if (!mic) {
-      alert("Your browser does not support Speech Recognition. Please use Google Chrome.");
+    if (!recognitionRef.current) {
+      alert("Your browser does not support Speech Recognition. Please use Google Chrome or Edge.");
       return;
     }
 
     if (isListening) {
-      mic.stop();
+      recognitionRef.current.stop();
       setIsListening(false);
+      setInterimInput('');
     } else {
-      mic.start();
-      setIsListening(true);
+      try {
+         // Add a space if there's already text before starting to listen again
+         setRawInput(prev => prev && !prev.endsWith(' ') ? prev + ' ' : prev);
+         recognitionRef.current.start();
+         setIsListening(true);
+      } catch (e) {
+         console.error("Could not start recognition:", e);
+      }
     }
+  };
+
+  // Combine rawInput (finalized) and interimInput for the textarea value
+  const displayValue = rawInput + interimInput;
+
+  const handleTextareaChange = (e) => {
+      // If the user manually types, update the rawInput and clear interim
+      setRawInput(e.target.value);
+      setInterimInput('');
   };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     setLoading(true);
     setError(null);
-    
-    // Submit කරද්දී Mic එක on වෙලා තියෙනවා නම් ඒක off කරනවා
-    if (isListening) {
-      mic.stop();
+
+    if (isListening && recognitionRef.current) {
+      recognitionRef.current.stop();
       setIsListening(false);
+      setInterimInput('');
     }
+
+    // Use the combined display value for submission
+    const finalSubmissionText = rawInput + interimInput;
 
     try {
       const payload = {
         patient_name: patientName,
         patient_age: parseInt(patientAge),
         patient_gender: patientGender,
-        raw_input: rawInput,
+        raw_input: finalSubmissionText,
       };
 
       const response = await axios.post('http://localhost:3000/api/process-note', payload);
@@ -114,12 +154,41 @@ function Consultation() {
     setPatientName('');
     setPatientAge('');
     setRawInput('');
+    setInterimInput('');
     setResult(null);
     setError(null);
-    if (isListening && mic) {
-      mic.stop();
+    setEditingItem(null);
+    if (isListening && recognitionRef.current) {
+      recognitionRef.current.stop();
       setIsListening(false);
     }
+  };
+
+  const handleSaveEdit = () => {
+      if (!editingItem || !result) return;
+
+      const newCost = parseFloat(editCost) || 0;
+      let updatedResult = { ...result };
+      
+      if (editingItem.type === 'drug') {
+          updatedResult.prescriptions[editingItem.index].cost = newCost;
+      } else if (editingItem.type === 'test') {
+          updatedResult.lab_tests[editingItem.index].cost = newCost;
+      }
+
+      const totalDrugs = updatedResult.prescriptions.reduce((sum, p) => sum + Number(p.cost), 0);
+      const totalTests = updatedResult.lab_tests.reduce((sum, t) => sum + Number(t.cost), 0);
+      const docFee = updatedResult.bill.other_charges;
+
+      updatedResult.bill = {
+          ...updatedResult.bill,
+          total_drugs_cost: totalDrugs,
+          total_tests_cost: totalTests,
+          final_amount: totalDrugs + totalTests + docFee
+      };
+
+      setResult(updatedResult);
+      setEditingItem(null);
   };
 
   return (
@@ -133,6 +202,7 @@ function Consultation() {
             .print-area { width: 100%; height: 100%; page-break-inside: avoid; }
             .no-print { display: none !important; }
             table, tr, td, .prevent-break { page-break-inside: avoid; }
+            .edit-controls { display: none !important; }
           }
         `}
       </style>
@@ -166,10 +236,10 @@ function Consultation() {
                 <div className="flex justify-between items-center mb-8 border-b border-slate-200/50 pb-4">
                   <h2 className="text-2xl font-black text-slate-800 flex items-center gap-3">
                     <FileText className="w-7 h-7 text-blue-600 group-hover:rotate-12 transition-transform duration-300" />
-                    Patient Intake
+                    Patient Record
                   </h2>
                   <div className="bg-blue-100/50 text-blue-700 px-3 py-1.5 rounded-lg font-bold text-xs flex items-center gap-1.5 border border-blue-200/50 shadow-inner">
-                     <ShieldCheck className="w-4 h-4 text-blue-500"/> AI Engine Active
+                     <ShieldCheck className="w-4 h-4 text-blue-500"/> Online & Secure
                   </div>
                 </div>
 
@@ -201,8 +271,7 @@ function Consultation() {
                     </div>
                   </div>
 
-                  {/* Clinical Notes & Voice Section */}
-                  <div className="w-full pt-4 group/input">
+                  <div className="w-full pt-4 group/input relative">
                     <label className="flex justify-between items-end mb-2 group-focus-within/input:text-blue-600 transition-colors">
                       <span className="font-bold text-sm uppercase tracking-widest text-slate-500">Clinical Notes</span>
                       <span className="text-[10px] font-black uppercase tracking-widest text-blue-500 bg-blue-100/50 px-2 py-1 rounded border border-blue-200/50">Voice / Text</span>
@@ -210,37 +279,33 @@ function Consultation() {
                     
                     <div className="relative">
                       <textarea className="w-full bg-white/50 hover:bg-white border border-white hover:border-blue-300 rounded-xl py-4 px-5 pr-16 text-lg font-medium text-slate-800 leading-relaxed focus:outline-none focus:ring-4 focus:ring-blue-100/50 focus:border-blue-500 transition-all duration-300 h-56 resize-none shadow-sm backdrop-blur-sm" 
-                                placeholder="Type symptoms or click the mic to speak (e.g., Panadol 500mg - 250 LKR)..."
-                                value={rawInput} onChange={(e) => setRawInput(e.target.value)} required></textarea>
+                                placeholder="Click the mic button and start speaking... (e.g., Patient needs Panadol 500mg, cost is 250 LKR)"
+                                value={displayValue} onChange={handleTextareaChange} required></textarea>
                       
-                      {/* Premium Floating Voice Button */}
                       <button 
                         type="button" 
                         onClick={toggleListen}
-                        className={`absolute right-4 bottom-4 p-4 rounded-full shadow-lg transition-all duration-300 border-2 flex items-center justify-center
+                        className={`absolute right-4 bottom-4 p-4 rounded-full shadow-lg transition-all duration-300 border-2 flex items-center justify-center z-20
                           ${isListening 
                             ? 'bg-red-500 text-white border-red-400 animate-pulse shadow-red-500/50 scale-110' 
                             : 'bg-white text-blue-600 border-blue-100 hover:bg-blue-50 hover:scale-105 hover:border-blue-300'}`}
                         title={isListening ? "Stop Listening" : "Start Voice Typing"}
                       >
-                        {isListening ? <MicOff className="w-6 h-6" /> : <Mic className="w-6 h-6" />}
-                        
-                        {/* Ping effect when listening */}
-                        {isListening && (
-                          <span className="absolute w-full h-full rounded-full bg-red-400 opacity-50 animate-ping"></span>
-                        )}
+                        {isListening ? <MicOff className="w-6 h-6 relative z-10" /> : <Mic className="w-6 h-6 relative z-10" />}
+                        {isListening && <span className="absolute w-full h-full rounded-full bg-red-400 opacity-50 animate-ping"></span>}
                       </button>
                     </div>
 
-                    <div className="mt-3 flex items-center gap-2 text-blue-600 font-bold text-sm bg-blue-100/50 p-3 rounded-lg border border-blue-200/50 transition-all duration-300 hover:shadow-md">
-                      <Activity className="w-5 h-5" />
-                      AI will automatically extract prescriptions & generate the final bill.
-                    </div>
+                    {isListening && (
+                       <p className="absolute -bottom-6 right-0 text-xs font-bold text-red-500 animate-pulse">
+                          Listening... Please speak clearly.
+                       </p>
+                    )}
                   </div>
 
                   <button 
                     type="submit"
-                    className={`w-full bg-blue-600 hover:bg-blue-700 text-white font-black text-lg py-5 rounded-xl shadow-lg hover:shadow-blue-500/40 transition-all duration-300 flex justify-center items-center gap-3 tracking-widest uppercase ${loading ? 'opacity-80 cursor-not-allowed scale-95' : 'hover:-translate-y-1 active:scale-95'}`} 
+                    className={`w-full bg-blue-600 hover:bg-blue-700 text-white font-black text-lg py-5 rounded-xl shadow-lg hover:shadow-blue-500/40 transition-all duration-300 flex justify-center items-center gap-3 tracking-widest uppercase mt-4 ${loading ? 'opacity-80 cursor-not-allowed scale-95' : 'hover:-translate-y-1 active:scale-95'}`} 
                     disabled={loading}
                   >
                     {loading ? (
@@ -331,12 +396,40 @@ function Consultation() {
                           <tbody>
                             {result.prescriptions && result.prescriptions.length > 0 ? (
                               result.prescriptions.map((p, idx) => (
-                                <tr key={p.id || idx} className="border-b border-slate-100 last:border-0 hover:bg-slate-50 transition-colors">
+                                <tr key={p.id || idx} className="border-b border-slate-100 last:border-0 hover:bg-slate-50 transition-colors group/row">
                                   <td className="py-4 px-4 print:py-2">
                                     <p className="font-bold text-lg text-slate-800 print:text-base">{p.drug_name}</p>
                                     <p className="text-sm font-medium text-slate-500 mt-1">{p.dosage}</p>
                                   </td>
-                                  <td className="py-4 px-4 text-right font-mono font-bold text-lg text-slate-800 print:text-base print:py-2">{Number(p.cost).toFixed(2)}</td>
+                                  <td className="py-4 px-4 text-right font-mono font-bold text-lg text-slate-800 print:text-base print:py-2 relative">
+                                    
+                                    {/* Edit Mode Logic for Drugs */}
+                                    {editingItem?.type === 'drug' && editingItem?.index === idx ? (
+                                      <div className="flex justify-end items-center gap-2 edit-controls">
+                                        <input 
+                                          type="number" 
+                                          className="w-24 px-2 py-1 text-right bg-white text-slate-900 border border-blue-300 rounded font-mono text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 shadow-inner"
+                                          value={editCost}
+                                          onChange={(e) => setEditCost(e.target.value)}
+                                          autoFocus
+                                        />
+                                        <button onClick={handleSaveEdit} className="text-green-600 hover:text-green-700 bg-green-50 p-1 rounded"><Check className="w-4 h-4"/></button>
+                                        <button onClick={() => setEditingItem(null)} className="text-red-600 hover:text-red-700 bg-red-50 p-1 rounded"><X className="w-4 h-4"/></button>
+                                      </div>
+                                    ) : (
+                                      <div className="flex justify-end items-center gap-3">
+                                        <span>{Number(p.cost).toFixed(2)}</span>
+                                        <button 
+                                          onClick={() => { setEditingItem({ type: 'drug', index: idx }); setEditCost(p.cost); }}
+                                          className="text-slate-300 hover:text-blue-600 opacity-0 group-hover/row:opacity-100 transition-opacity edit-controls"
+                                          title="Edit Cost"
+                                        >
+                                          <Edit2 className="w-4 h-4" />
+                                        </button>
+                                      </div>
+                                    )}
+
+                                  </td>
                                 </tr>
                               ))
                             ) : (
@@ -363,9 +456,37 @@ function Consultation() {
                           <tbody>
                             {result.lab_tests && result.lab_tests.length > 0 ? (
                               result.lab_tests.map((t, idx) => (
-                                <tr key={t.id || idx} className="border-b border-slate-100 last:border-0 hover:bg-slate-50 transition-colors">
+                                <tr key={t.id || idx} className="border-b border-slate-100 last:border-0 hover:bg-slate-50 transition-colors group/row">
                                   <td className="py-4 px-4 font-bold text-lg text-slate-800 print:text-base print:py-2">{t.test_name}</td>
-                                  <td className="py-4 px-4 text-right font-mono font-bold text-lg text-slate-800 print:text-base print:py-2">{Number(t.cost).toFixed(2)}</td>
+                                  <td className="py-4 px-4 text-right font-mono font-bold text-lg text-slate-800 print:text-base print:py-2 relative">
+                                    
+                                    {/* Edit Mode Logic for Labs */}
+                                    {editingItem?.type === 'test' && editingItem?.index === idx ? (
+                                      <div className="flex justify-end items-center gap-2 edit-controls">
+                                        <input 
+                                          type="number" 
+                                          className="w-24 px-2 py-1 text-right bg-white text-slate-900 border border-blue-300 rounded font-mono text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 shadow-inner"
+                                          value={editCost}
+                                          onChange={(e) => setEditCost(e.target.value)}
+                                          autoFocus
+                                        />
+                                        <button onClick={handleSaveEdit} className="text-green-600 hover:text-green-700 bg-green-50 p-1 rounded"><Check className="w-4 h-4"/></button>
+                                        <button onClick={() => setEditingItem(null)} className="text-red-600 hover:text-red-700 bg-red-50 p-1 rounded"><X className="w-4 h-4"/></button>
+                                      </div>
+                                    ) : (
+                                      <div className="flex justify-end items-center gap-3">
+                                        <span>{Number(t.cost).toFixed(2)}</span>
+                                        <button 
+                                          onClick={() => { setEditingItem({ type: 'test', index: idx }); setEditCost(t.cost); }}
+                                          className="text-slate-300 hover:text-blue-600 opacity-0 group-hover/row:opacity-100 transition-opacity edit-controls"
+                                          title="Edit Cost"
+                                        >
+                                          <Edit2 className="w-4 h-4" />
+                                        </button>
+                                      </div>
+                                    )}
+
+                                  </td>
                                 </tr>
                               ))
                             ) : (
@@ -417,7 +538,6 @@ function Consultation() {
                 </div>
               </div>
             ) : (
-              /* Waiting State UI - Glassmorphism Updated */
               <div className="h-full min-h-[600px] border-4 border-dashed border-white/50 bg-white/30 backdrop-blur-md rounded-3xl flex flex-col items-center justify-center p-12 text-center no-print transition-all duration-300 hover:border-blue-300 hover:bg-white/50 group shadow-lg">
                 <div className="p-6 bg-white/80 rounded-full mb-6 text-blue-600 shadow-xl group-hover:scale-110 group-hover:bg-blue-600 group-hover:text-white transition-all duration-500 border border-white">
                   <Stethoscope className="w-16 h-16" />

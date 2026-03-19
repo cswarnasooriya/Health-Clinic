@@ -7,7 +7,7 @@ function Home() {
   const stats = [
     { title: "Today's Patients", value: "24", icon: Users, color: "text-blue-600", glow: "hover:shadow-blue-500/20" },
     { title: "Pending Reports", value: "07", icon: Activity, color: "text-amber-600", glow: "hover:shadow-amber-500/20" },
-    { title: "Weekly Revenue", value: "145K", icon: TrendingUp, color: "text-emerald-600", glow: "hover:shadow-emerald-500/20", suffix: "LKR" }
+    { title: "Weekly Revenue", value: "34 800", icon: TrendingUp, color: "text-emerald-600", glow: "hover:shadow-emerald-500/20", suffix: "LKR" }
   ];
 
   return (
